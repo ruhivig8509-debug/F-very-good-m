@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+sqlalchemy
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+aiohttp
+websockets
+jinja2
+httpx
+pyotp
+qrcode
+apscheduler
+aiosqlite
+pydantic
