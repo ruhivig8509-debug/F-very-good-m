@@ -46,7 +46,6 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, asdict
 import socket
 import ssl
-import struct
 import ipaddress
 
 # ============================================================================
@@ -57,7 +56,7 @@ def install_deps():
         "fastapi", "uvicorn", "sqlalchemy", "python-jose",
         "passlib", "bcrypt", "python-multipart", "aiohttp",
         "websockets", "jinja2", "httpx", "pyotp", "qrcode",
-        "apscheduler", "aiosqlite", "pydantic"
+        "apscheduler", "aiosqlite", "pydantic", "psycopg2-binary"
     ]
     for dep in deps:
         try:
@@ -84,7 +83,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import (
     create_engine, Column, Integer, String, Float, Boolean, DateTime,
     Text, ForeignKey, Enum as SQLEnum, JSON, Index, event, func,
-    Table, MetaData
+    Table, MetaData, text as sa_text
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
@@ -110,11 +109,20 @@ class Config:
     JWT_SECRET = secrets.token_hex(32)
     JWT_ALGORITHM = "HS256"
     JWT_EXPIRY_HOURS = 24
-    DATABASE_URL = "sqlite:///./monitoring.db"
+
+    _raw_db_url = os.environ.get("DATABASE_URL", "")
+    if _raw_db_url:
+        if _raw_db_url.startswith("postgres://"):
+            DATABASE_URL = _raw_db_url.replace("postgres://", "postgresql://", 1)
+        else:
+            DATABASE_URL = _raw_db_url
+    else:
+        DATABASE_URL = "sqlite:///./monitoring.db"
+
     SUPERADMIN_USERNAME = "RUHIVIGQNR"
     SUPERADMIN_PASSWORD = "RUHIVIGQNR"
     HOST = "0.0.0.0"
-    PORT = 8000
+    PORT = int(os.environ.get("PORT", 8000))
     LOG_LEVEL = "INFO"
     MAX_MONITORS_PER_USER = 50
     CHECK_INTERVAL_SECONDS = 60
@@ -142,12 +150,22 @@ logger = logging.getLogger("MonitorPro")
 # ============================================================================
 # DATABASE SETUP
 # ============================================================================
-engine = create_engine(
-    config.DATABASE_URL,
-    connect_args={"check_same_thread": False},
-    poolclass=StaticPool,
-    echo=False
-)
+if config.DATABASE_URL.startswith("sqlite"):
+    engine = create_engine(
+        config.DATABASE_URL,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+        echo=False
+    )
+else:
+    engine = create_engine(
+        config.DATABASE_URL,
+        echo=False,
+        pool_pre_ping=True,
+        pool_size=10,
+        max_overflow=20
+    )
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -956,7 +974,6 @@ def init_superadmin():
             db.commit()
             logger.info(f"Superadmin created: {config.SUPERADMIN_USERNAME}")
 
-        # Initialize default settings
         default_settings = {
             "site_name": ("MonitorPro SaaS", "general"),
             "site_description": ("Production Monitoring Platform", "general"),
@@ -1796,8 +1813,18 @@ async def system_stats(user: dict = Depends(require_admin), db: Session = Depend
     total_alerts = db.query(AlertChannel).count()
     total_sessions = db.query(UserSession).filter(UserSession.is_active == True).count()
 
-    db_path = Path("monitoring.db")
-    db_size = db_path.stat().st_size if db_path.exists() else 0
+    db_size = 0
+    if config.DATABASE_URL.startswith("sqlite"):
+        db_path = Path("monitoring.db")
+        db_size = db_path.stat().st_size if db_path.exists() else 0
+    else:
+        try:
+            result = db.execute(sa_text("SELECT pg_database_size(current_database())"))
+            row = result.fetchone()
+            if row:
+                db_size = row[0]
+        except Exception:
+            db_size = 0
 
     return {
         "total_users": total_users, "total_monitors": total_monitors,
@@ -1814,42 +1841,52 @@ async def system_stats(user: dict = Depends(require_admin), db: Session = Depend
 # --- 14. Database Backup ---
 @app.post("/api/admin/database/backup")
 async def database_backup(user: dict = Depends(require_superadmin), db: Session = Depends(get_db)):
-    import shutil
-    backup_name = f"backup_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.db"
-    try:
-        shutil.copy2("monitoring.db", backup_name)
-        log_audit(db, user["user_id"], user["username"], "database_backup", "database", backup_name)
-        return {"message": f"Backup created: {backup_name}", "filename": backup_name}
-    except Exception as e:
-        raise HTTPException(500, f"Backup failed: {e}")
+    if config.DATABASE_URL.startswith("sqlite"):
+        import shutil
+        backup_name = f"backup_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.db"
+        try:
+            shutil.copy2("monitoring.db", backup_name)
+            log_audit(db, user["user_id"], user["username"], "database_backup", "database", backup_name)
+            return {"message": f"Backup created: {backup_name}", "filename": backup_name}
+        except Exception as e:
+            raise HTTPException(500, f"Backup failed: {e}")
+    else:
+        log_audit(db, user["user_id"], user["username"], "database_backup_request", "database", "postgresql")
+        return {"message": "PostgreSQL backup requested. Use pg_dump for full backups on Render.", "filename": "pg_backup"}
 
 # --- 15. Database Vacuum ---
 @app.post("/api/admin/database/vacuum")
-async def database_vacuum(user: dict = Depends(require_superadmin)):
-    try:
-        conn = sqlite3.connect("monitoring.db")
-        conn.execute("VACUUM")
-        conn.close()
-        return {"message": "Database vacuumed successfully"}
-    except Exception as e:
-        raise HTTPException(500, f"Vacuum failed: {e}")
+async def database_vacuum(user: dict = Depends(require_superadmin), db: Session = Depends(get_db)):
+    if config.DATABASE_URL.startswith("sqlite"):
+        try:
+            conn = sqlite3.connect("monitoring.db")
+            conn.execute("VACUUM")
+            conn.close()
+            return {"message": "Database vacuumed successfully"}
+        except Exception as e:
+            raise HTTPException(500, f"Vacuum failed: {e}")
+    else:
+        try:
+            db.execute(sa_text("VACUUM ANALYZE"))
+            db.commit()
+            return {"message": "PostgreSQL VACUUM ANALYZE completed"}
+        except Exception as e:
+            db.rollback()
+            return {"message": f"VACUUM requested (may require superuser): {e}"}
 
 # --- 16. Database Stats ---
 @app.get("/api/admin/database/stats")
 async def database_stats(user: dict = Depends(require_admin), db: Session = Depends(get_db)):
     tables = {}
-    for table_name in ["users", "monitors", "monitor_logs", "incidents", "alert_channels",
-                       "audit_logs", "site_settings", "status_pages", "user_sessions",
-                       "maintenance_windows", "ip_whitelist", "notification_templates"]:
+    table_names = ["users", "monitors", "monitor_logs", "incidents", "alert_channels",
+                   "audit_logs", "site_settings", "status_pages", "user_sessions",
+                   "maintenance_windows", "ip_whitelist", "notification_templates"]
+    for table_name in table_names:
         try:
-            count = db.execute(func.count()).select_from(Base.metadata.tables.get(table_name)).scalar()
-            tables[table_name] = count
-        except:
-            try:
-                result = db.execute(f"SELECT COUNT(*) FROM {table_name}")
-                tables[table_name] = result.scalar()
-            except:
-                tables[table_name] = "N/A"
+            result = db.execute(sa_text(f"SELECT COUNT(*) FROM {table_name}"))
+            tables[table_name] = result.scalar()
+        except Exception:
+            tables[table_name] = "N/A"
     return {"tables": tables}
 
 # --- 17. Clear Cache ---
@@ -2275,9 +2312,9 @@ async def health_check(user: dict = Depends(require_admin)):
     }
     try:
         db = SessionLocal()
-        db.execute("SELECT 1")
+        db.execute(sa_text("SELECT 1"))
         db.close()
-    except:
+    except Exception:
         checks["database"] = "error"
 
     overall = "healthy" if all(v == "ok" for v in checks.values()) else "degraded"
@@ -3377,13 +3414,15 @@ async def public_health():
 # ============================================================================
 if __name__ == "__main__":
     import uvicorn
+    run_port = int(os.environ.get("PORT", 8000))
     print(f"""
 ╔══════════════════════════════════════════════════════════════╗
 ║              MonitorPro SaaS Platform v2.0                   ║
 ║══════════════════════════════════════════════════════════════║
-║  URL:        http://localhost:{config.PORT}                        ║
+║  URL:        http://localhost:{run_port}                        ║
 ║  SuperAdmin: {config.SUPERADMIN_USERNAME} / {config.SUPERADMIN_PASSWORD}                  ║
-║  API Docs:   http://localhost:{config.PORT}/docs                   ║
+║  API Docs:   http://localhost:{run_port}/docs                   ║
+║  Database:   {config.DATABASE_URL[:50]}...  ║
 ║  Features:   70+ Admin Features                              ║
 ║  Frontend:   Mobile-First React + Tailwind                   ║
 ╚══════════════════════════════════════════════════════════════╝
@@ -3391,7 +3430,7 @@ if __name__ == "__main__":
     uvicorn.run(
         app,
         host=config.HOST,
-        port=config.PORT,
+        port=run_port,
         log_level="info",
         access_log=True
     )
