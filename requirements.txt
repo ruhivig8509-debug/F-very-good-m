@@ -13,3 +13,4 @@ qrcode
 apscheduler
 aiosqlite
 pydantic
+psycopg2-binary
