@@ -384,6 +384,12 @@ class UserUpdate(BaseModel):
 class SettingUpdate(BaseModel):
     value: str; category: Optional[str] = None
 
+class AlertChannelCreate(BaseModel):
+    name: str
+    channel_type: str
+    config: Optional[dict] = None
+    is_default: bool = False
+
 # =============================================================================
 # SECTION 9: JWT TOKEN SYSTEM (Access + Refresh)
 # =============================================================================
